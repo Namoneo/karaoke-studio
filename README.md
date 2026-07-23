@@ -8,12 +8,13 @@ Transform any song into a complete, professional karaoke video package with mini
 
 - **Audio Analysis** — Auto-detects BPM, key, mood, energy, genre via librosa
 - **Visual Style Engine** — Every song gets a unique visual identity (28 background types, mood-matched palettes, fonts, particles)
-- **Animated Backgrounds** — 28 procedural 4K backgrounds (neon grid, aurora, rain, golden particles, space nebula, city lights, etc.)
-- **Karaoke Lyrics** — Whisper transcription with word-by-word sync, ASS/SRT/LRC output
-- **Audio Visualization** — Waveforms, spectrum, equalizers reactive to music
+- **Animated Backgrounds** — 28 procedural backgrounds rendered natively at the target resolution (up to 4K) as short **seamless loops** the compositor tiles to length
+- **Karaoke Lyrics** — Whisper transcription with word-by-word sync; user-supplied lyrics are **force-aligned** to the audio. ASS/SRT/LRC output
+- **Audio Visualization** — Distinct reactive styles: circular scope (avectorscope), frequency bars (showfreqs), waveform and minimal line (showwaves)
+- **Branding** — Title card, channel watermark, optional logo overlay, animated Subscribe call-to-action
 - **Multi-format Export** — 4K 16:9, 1080p, 9:16 Shorts, thumbnail
 - **SEO Metadata** — Title, description, tags, hashtags, pinned comment
-- **Production Report** — Full summary of all decisions
+- **Measured Quality Checks** — The report verifies real lyric timing and output files, not a fixed checklist
 
 ## Requirements
 
@@ -59,7 +60,12 @@ python karaoke_studio.py   --audio song.mp3   --title "Song Name"   --artist "Ar
 
 # Skip Shorts or 1080p for faster processing
 python karaoke_studio.py --audio song.mp3 --title "Song" --skip-shorts --skip-1080p
+
+# Add a channel logo and disable the Subscribe call-to-action
+python karaoke_studio.py --audio song.mp3 --title "Song" --logo logo.png --no-subscribe
 ```
+
+Other flags: `--whisper-model {tiny,base,small,medium,large}`, `--no-viz`, `--output DIR`.
 
 ## Output
 

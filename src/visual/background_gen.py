@@ -36,23 +36,36 @@ def hex_to_hsv(hex_color):
 
 
 def generate_background(bg_type, palette, params, duration, output_path,
-                        width=3840, height=2160, fps=30):
-    """Generate animated background video."""
+                        width=3840, height=2160, fps=30, loop_seconds=12.0):
+    """Generate a seamless, native-resolution animated background loop.
+
+    The video is rendered as a short seamless loop (``loop_seconds``) rather
+    than the full song length; the compositor tiles it to fill the track. This
+    keeps native-4K rendering affordable and produces a genuinely seamless
+    background. The output pixel resolution matches ``width``x``height``.
+    """
     output_path = str(output_path)
-    
-    # Use 1920x1080 for render speed, upscale later
-    render_w, render_h = 1920, 1080
+
     render_fps = 30
-    
-    fig, ax = plt.subplots(figsize=(render_w / 100, render_h / 100), dpi=100)
+
+    # The matplotlib canvas keeps a fixed 1920x1080 data-coordinate system; the
+    # output pixel resolution is set purely through dpi, so requesting 4K
+    # (height 2160) renders natively at 3840x2160 with line widths and marker
+    # sizes scaling proportionally — no per-generator changes needed.
+    render_w, render_h = 1920, 1080
+    render_dpi = int(round(100 * max(1.0, height / 1080.0)))
+
+    fig, ax = plt.subplots(figsize=(render_w / 100, render_h / 100), dpi=render_dpi)
     fig.patch.set_facecolor('#000000')
     ax.set_xlim(0, render_w)
     ax.set_ylim(0, render_h)
     ax.set_aspect('equal')
     ax.axis('off')
-    
-    total_frames = int(duration * render_fps)
-    
+
+    # Render only a short loop; the compositor loops it to the full duration.
+    loop_len = min(float(duration), float(loop_seconds)) if duration > 0 else float(loop_seconds)
+    total_frames = max(1, int(loop_len * render_fps))
+
     # Select generator
     generators = {
         "neon_grid": gen_neon_grid,
@@ -102,13 +115,23 @@ def generate_background(bg_type, palette, params, duration, output_path,
                 frame=frame, state=state)
         return []
     
-    anim = FuncAnimation(fig, update, frames=total_frames, interval=1000/render_fps, blit=False)
-    
-    writer = FFMpegWriter(fps=render_fps, 
+    # Boomerang the frame order (forward, then reverse) so the last rendered
+    # frame is adjacent to the first — a seamless loop for any generator,
+    # without ffmpeg having to buffer the whole clip to reverse it. Endpoints
+    # are not duplicated.
+    if total_frames > 2:
+        frame_sequence = list(range(total_frames)) + list(range(total_frames - 2, 0, -1))
+    else:
+        frame_sequence = list(range(total_frames))
+
+    anim = FuncAnimation(fig, update, frames=frame_sequence,
+                         interval=1000 / render_fps, blit=False)
+
+    writer = FFMpegWriter(fps=render_fps,
                          extra_args=['-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                                     '-crf', '18', '-preset', 'fast'])
-    
-    anim.save(output_path, writer=writer, dpi=100, savefig_kwargs={'facecolor': '#000000'})
+
+    anim.save(output_path, writer=writer, dpi=render_dpi, savefig_kwargs={'facecolor': '#000000'})
     plt.close(fig)
     return output_path
 
