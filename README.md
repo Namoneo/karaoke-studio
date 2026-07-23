@@ -18,17 +18,32 @@ Transform any song into a complete, professional karaoke video package with mini
 ## Requirements
 
 - Python 3.12+
-- ffmpeg-full (with drawtext, libass, libfreetype)
-- macOS (uses system fonts)
+- ffmpeg (with drawtext, libass, libfreetype)
+- macOS, Linux, or Windows — fonts are auto-detected per platform, falling
+  back to matplotlib's bundled DejaVuSans if no system fonts are found
 
 ## Installation
 
+### macOS
+
 ```bash
-brew install python@3.12 ffmpeg-full
+brew install python@3.12 ffmpeg
 
 git clone https://github.com/Namoneo/karaoke-studio.git
 cd karaoke-studio
 python3.12 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt install python3 python3-venv ffmpeg fonts-liberation fonts-dejavu
+
+git clone https://github.com/Namoneo/karaoke-studio.git
+cd karaoke-studio
+python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```

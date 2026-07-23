@@ -116,10 +116,18 @@ def compose_video(
             "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
     
-    fonts_dir = "/System/Library/Fonts"
+    # Point libass at the directory containing the resolved primary font so it
+    # can find it by name; fall back to the macOS system font dir. Cross-platform
+    # font resolution happens in style_engine.resolve_font().
+    font_primary_path = style_config.get("font_primary", "")
+    if font_primary_path and Path(font_primary_path).exists():
+        fonts_dir = str(Path(font_primary_path).parent)
+    else:
+        fonts_dir = "/System/Library/Fonts"
     # Escape colons in path for ffmpeg
     ass_path_escaped = ass_subtitle_path.replace(":", "\\:")
-    sub_filter = f"{bg_final}subtitles='{ass_path_escaped}':fontsdir='{fonts_dir}'"
+    fonts_dir_escaped = fonts_dir.replace(":", "\\:")
+    sub_filter = f"{bg_final}subtitles='{ass_path_escaped}':fontsdir='{fonts_dir_escaped}'"
     filters.append(f"{sub_filter}[lyrics_bg]")
     
     # === Branding overlay (title at start, channel name) ===
