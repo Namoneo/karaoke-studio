@@ -40,12 +40,10 @@ FFMPEG_FULL = "/opt/homebrew/opt/ffmpeg-full/bin"
 if Path(FFMPEG_FULL).exists():
     os.environ["PATH"] = FFMPEG_FULL + ":" + os.environ.get("PATH", "")
 
-from audio.analyzer import analyze_audio
-from visual.style_engine import generate_style
-from visual.background_gen import generate_background
-from lyrics.karaoke import process_lyrics
-from export.composer import compose_video, export_shorts_version, export_1080p_version, generate_thumbnail
-from metadata.seo_generator import generate_metadata
+# NOTE: the heavy pipeline dependencies (librosa, whisper, matplotlib, ffmpeg
+# wrappers) are imported lazily inside run_karaoke_studio() so that `--help`
+# and argument validation work without the full stack installed, and a missing
+# dependency surfaces as a clear message rather than an import traceback.
 
 
 # Mood descriptions for SEO
@@ -80,10 +78,31 @@ def run_karaoke_studio(
     with_visualization: bool = True,
     skip_shorts: bool = False,
     skip_1080p: bool = False,
+    logo_path: str = None,
+    show_subscribe: bool = True,
 ):
     """
     Main pipeline: Audio → Analyze → Style → Background → Lyrics → Compose → Export → Metadata
     """
+    # Imported here (not at module load) so the CLI stays usable without the
+    # full dependency stack — see the note near the top of this file.
+    try:
+        from audio.analyzer import analyze_audio
+        from visual.style_engine import generate_style
+        from visual.background_gen import generate_background
+        from lyrics.karaoke import process_lyrics
+        from export.composer import (
+            compose_video, export_shorts_version,
+            export_1080p_version, generate_thumbnail,
+        )
+        from metadata.seo_generator import generate_metadata
+        from quality.check import run_quality_checks, summarize
+    except ImportError as e:
+        raise RuntimeError(
+            f"Missing a required dependency ({e.name}). "
+            "Install the pipeline requirements with: pip install -r requirements.txt"
+        ) from e
+
     start_time = time.time()
     audio_path = Path(audio_path).resolve()
     
@@ -235,6 +254,7 @@ def run_karaoke_studio(
     lyrics_result = process_lyrics(
         audio_path=str(audio_path),
         lyrics=lyrics_text,
+        model_name=whisper_model,
         style_config={
             "font_name": Path(style.font_primary).stem,
             "font_size": style.font_size_lyrics,
@@ -302,6 +322,8 @@ def run_karaoke_studio(
             "type": style.viz_type,
             "params": style.viz_params,
         },
+        logo_path=logo_path,
+        show_subscribe=show_subscribe,
     )
     print(f"   4K video: {video_4k_path.name}")
     
@@ -379,6 +401,27 @@ def run_karaoke_studio(
     print(f"   Hashtags: {' '.join(metadata.hashtags[:5])}...")
     
     # ─────────────────────────────────────
+    # Quality Checks (measured, not assumed)
+    # ─────────────────────────────────────
+    print("\n🔍 Running quality checks...")
+    quality_checks = run_quality_checks(
+        lyrics_result=lyrics_result,
+        duration=analysis.duration,
+        output_files={
+            "4K 16:9 video": video_4k_path,
+            "1080p 16:9 video": video_1080_path,
+            "Shorts 9:16": shorts_path,
+            "Thumbnail": thumbnail_path,
+            "ASS subtitles": output_dir / "lyrics.ass",
+        },
+    )
+    passed, total = summarize(quality_checks)
+    for c in quality_checks:
+        mark = "✓" if c["passed"] else "✗"
+        print(f"   {mark} {c['name']}" + (f" — {c['detail']}" if c["detail"] else ""))
+    print(f"   → {passed}/{total} checks passed")
+
+    # ─────────────────────────────────────
     # Generate Report
     # ─────────────────────────────────────
     elapsed = time.time() - start_time
@@ -386,22 +429,24 @@ def run_karaoke_studio(
         song_title, artist_name, analysis, style, lyrics_result,
         output_dir, elapsed, metadata,
         video_4k_path, video_1080_path, shorts_path, thumbnail_path,
+        quality_checks,
     )
-    
+
     with open(output_dir / "report.txt", "w") as f:
         f.write(report)
-    
+
     print(f"\n{'='*60}")
-    print(f"  ✅ COMPLETE in {elapsed:.1f}s")
+    print(f"  ✅ COMPLETE in {elapsed:.1f}s  ({passed}/{total} quality checks passed)")
     print(f"  Output: {output_dir}")
     print(f"{'='*60}\n")
-    
+
     return output_dir
 
 
 def generate_report(song_title, artist_name, analysis, style, lyrics_result,
                     output_dir, elapsed, metadata,
-                    video_4k, video_1080, shorts, thumbnail) -> str:
+                    video_4k, video_1080, shorts, thumbnail,
+                    quality_checks=None) -> str:
     """Generate a readable report file."""
     lines = [
         "╔══════════════════════════════════════════════════════════════╗",
@@ -467,14 +512,21 @@ def generate_report(song_title, artist_name, analysis, style, lyrics_result,
         f"Tags: {', '.join(metadata.youtube_tags[:8])}...",
         f"Category: {metadata.category}",
         "",
-        "── PUBLICATION CHECKLIST ─────────────────────────",
-        "✓ Lyrics synced with audio",
-        "✓ Background matches mood",
-        "✓ Audio visualization included",
-        "✓ Thumbnail generated",
-        "✓ SEO metadata generated",
-        "✓ Multiple formats exported",
-        "✓ No copyright material in visuals",
+        "── QUALITY CHECKS ────────────────────────────────",
+    ])
+
+    if quality_checks:
+        passed = sum(1 for c in quality_checks if c["passed"])
+        for c in quality_checks:
+            mark = "✓" if c["passed"] else "✗"
+            detail = f"  ({c['detail']})" if c.get("detail") else ""
+            lines.append(f"{mark} {c['name']}{detail}")
+        lines.append("")
+        lines.append(f"Result: {passed}/{len(quality_checks)} checks passed")
+    else:
+        lines.append("(not run)")
+
+    lines.extend([
         "",
         "── PUBLICATION NOTES ─────────────────────────────",
         "• Upload video_4k_16x9.mp4 as primary video",
@@ -484,5 +536,91 @@ def generate_report(song_title, artist_name, analysis, style, lyrics_result,
         "• Pin the pinned comment from metadata",
         "",
     ])
-    
+
     return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="karaoke_studio.py",
+        description="Autonomous YouTube karaoke video producer — turns a song "
+                    "into a complete karaoke video package.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python karaoke_studio.py --audio song.mp3 --title \"Song\" --artist \"Artist\"\n"
+            "  python karaoke_studio.py --audio song.mp3 --title \"Song\" --lyrics-file lyrics.txt\n"
+            "  python karaoke_studio.py --audio song.mp3 --title \"Song\" --skip-shorts --skip-1080p\n"
+        ),
+    )
+    parser.add_argument("--audio", required=True,
+                        help="Path to the input audio file (mp3, wav, etc.)")
+    parser.add_argument("--title", required=True,
+                        help="Song title")
+    parser.add_argument("--artist", default="",
+                        help="Artist name (optional)")
+
+    lyrics_group = parser.add_mutually_exclusive_group()
+    lyrics_group.add_argument("--lyrics", default=None,
+                              help="Lyrics text passed directly on the command line")
+    lyrics_group.add_argument("--lyrics-file", default=None,
+                              help="Path to a text file containing the lyrics. "
+                                   "If neither --lyrics nor --lyrics-file is given, "
+                                   "lyrics are transcribed automatically with Whisper.")
+
+    parser.add_argument("--channel", default="Karaoke Studio",
+                        help="Channel name shown as a watermark (default: %(default)s)")
+    parser.add_argument("--output", default=None,
+                        help="Output directory (default: output/<song title>)")
+    parser.add_argument("--whisper-model", default="base",
+                        choices=["tiny", "base", "small", "medium", "large"],
+                        help="Whisper model used for transcription/sync (default: %(default)s)")
+    parser.add_argument("--logo", default=None,
+                        help="Path to a channel logo image (PNG) overlaid top-right")
+    parser.add_argument("--no-subscribe", action="store_true",
+                        help="Disable the animated Subscribe call-to-action")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Disable the audio visualization overlay")
+    parser.add_argument("--skip-shorts", action="store_true",
+                        help="Skip rendering the 9:16 Shorts version")
+    parser.add_argument("--skip-1080p", action="store_true",
+                        help="Skip rendering the 1080p version")
+    return parser
+
+
+def main(argv=None) -> int:
+    """CLI entry point. Returns a process exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        run_karaoke_studio(
+            audio_path=args.audio,
+            song_title=args.title,
+            artist_name=args.artist,
+            lyrics=args.lyrics,
+            lyrics_file=args.lyrics_file,
+            channel_name=args.channel,
+            output_dir=args.output,
+            whisper_model=args.whisper_model,
+            with_visualization=not args.no_viz,
+            skip_shorts=args.skip_shorts,
+            skip_1080p=args.skip_1080p,
+            logo_path=args.logo,
+            show_subscribe=not args.no_subscribe,
+        )
+    except FileNotFoundError as e:
+        print(f"\n❌ {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n⏹️  Interrupted by user.", file=sys.stderr)
+        return 130
+    except Exception as e:
+        print(f"\n❌ Karaoke Studio failed: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -32,6 +32,8 @@ def compose_video(
     fps: int = 30,
     with_viz: bool = True,
     viz_config: dict = None,
+    logo_path: str = None,
+    show_subscribe: bool = True,
 ) -> str:
     """
     Compose the final karaoke video using ffmpeg.
@@ -116,10 +118,18 @@ def compose_video(
             "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         )
     
-    fonts_dir = "/System/Library/Fonts"
+    # Point libass at the directory containing the resolved primary font so it
+    # can find it by name; fall back to the macOS system font dir. Cross-platform
+    # font resolution happens in style_engine.resolve_font().
+    font_primary_path = style_config.get("font_primary", "")
+    if font_primary_path and Path(font_primary_path).exists():
+        fonts_dir = str(Path(font_primary_path).parent)
+    else:
+        fonts_dir = "/System/Library/Fonts"
     # Escape colons in path for ffmpeg
     ass_path_escaped = ass_subtitle_path.replace(":", "\\:")
-    sub_filter = f"{bg_final}subtitles='{ass_path_escaped}':fontsdir='{fonts_dir}'"
+    fonts_dir_escaped = fonts_dir.replace(":", "\\:")
+    sub_filter = f"{bg_final}subtitles='{ass_path_escaped}':fontsdir='{fonts_dir_escaped}'"
     filters.append(f"{sub_filter}[lyrics_bg]")
     
     # === Branding overlay (title at start, channel name) ===
@@ -181,21 +191,56 @@ def compose_video(
             f"borderw=2:bordercolor=black"
         )
     
+    # Animated "Subscribe" call-to-action, pulsing during the final ~10 seconds.
+    if show_subscribe and duration > 12:
+        cta_font = style_config.get("font_primary", "/System/Library/Fonts/HelveticaNeue.ttc")
+        cta_color = ffmpeg_color(palette[0] if palette else "#FFFFFF")
+        cta_start = round(duration - 10.0, 2)
+        branding_parts.append(
+            f"drawtext=fontfile='{cta_font}':"
+            f"text='► SUBSCRIBE':"
+            f"fontsize=44:"
+            f"fontcolor={cta_color}:"
+            f"x=(w-text_w)/2:y=h*0.9:"
+            f"borderw=3:bordercolor=black:"
+            f"alpha='if(gt(t,{cta_start}),0.2+0.6*abs(sin(2*PI*0.8*t)),0)'"
+        )
+
     if branding_parts:
         branding_chain = "[lyrics_bg]" + ",".join(branding_parts) + "[final]"
         filters.append(branding_chain)
         final_name = "[final]"
     else:
         final_name = "[lyrics_bg]"
-    
+
+    # Optional channel logo overlay (top-right), composited as a third input.
+    use_logo = bool(logo_path) and Path(logo_path).exists()
+    if use_logo:
+        logo_h = int(height * 0.09)
+        filters.append(
+            f"[2:v]scale=-1:{logo_h},format=rgba,colorchannelmixer=aa=0.85[logo]"
+        )
+        filters.append(f"{final_name}[logo]overlay=W-w-40:40[branded]")
+        final_name = "[branded]"
+
     # === Build full filter_complex ===
     filter_complex = ";".join(filters)
     
     # === Build ffmpeg command ===
+    # The background is a short seamless loop; -stream_loop tiles it to fill the
+    # track, and -t (below) trims to the exact song length. Only loop when we
+    # have a real duration to trim against, otherwise an infinite loop would
+    # never terminate.
+    bg_input_opts = ["-stream_loop", "-1"] if duration > 0 else []
+    # Logo is input index 2 (referenced as [2:v] above); loop the still image
+    # so it is available for the whole track.
+    logo_input = ["-loop", "1", "-i", str(logo_path)] if use_logo else []
     cmd = [
         FFMPEG_BIN, "-y",
-        "-i", background_path,        # 0: background video
+        *bg_input_opts,
+        "-i", background_path,        # 0: background video (looped)
         "-i", audio_path,             # 1: audio
+        *logo_input,                  # 2: logo image (optional)
         "-filter_complex", filter_complex,
         "-map", final_name,
         "-map", "1:a",
@@ -228,59 +273,68 @@ def compose_video(
     return output_path
 
 
-def build_viz_filter(viz_type: str, params: dict, palette: list, 
+def build_viz_filter(viz_type: str, params: dict, palette: list,
                      width: int, height: int, style_config: dict) -> str:
-    """Build audio visualization filter for ffmpeg."""
-    
+    """Build an audio visualization filter for ffmpeg.
+
+    Each visualization type maps to a genuinely distinct ffmpeg source filter
+    (rather than every type collapsing to the same waveform):
+
+      * circular_spectrum   -> avectorscope (a circular Lissajous scope)
+      * vertical_bars       -> showfreqs bars (full-height frequency bars)
+      * horizontal_equalizer-> showfreqs bars (a short, wide equalizer strip)
+      * waveform            -> showwaves cline (a centered waveform)
+      * minimal_spectrum    -> showwaves line (a thin, subtle line)
+
+    All are alpha-composited over the background at the configured opacity.
+    """
     opacity = params.get("opacity", 0.6)
     # Convert hex to 0x format for ffmpeg
     viz_color = "0x" + palette[0].lstrip('#') if palette else "0x3A86FF"
     viz_color2 = "0x" + palette[1].lstrip('#') if len(palette) > 1 else viz_color
-    
+
+    def alpha(o):
+        return f"format=rgba,colorchannelmixer=aa={max(0.0, min(1.0, o))}[viz]"
+
     if viz_type == "circular_spectrum":
-        bars = params.get("bars", 64)
-        radius = params.get("radius", 0.15)
+        # avectorscope draws a circular oscilloscope from the stereo signal.
+        # Kept square and centered by the compositor's overlay, so the black
+        # canvas doesn't cover (and darken) the whole frame.
         return (
-            f"[1:a]showwaves=s={width}x{height}:mode=cline:rate=30:colors={viz_color}|{viz_color2},"
-            f"format=rgba,colorchannelmixer=aa={opacity}[viz]"
+            f"[1:a]avectorscope=s={height}x{height}:rate=30:mode=lissajous:"
+            f"draw=line:scale=cbrt,{alpha(opacity)}"
         )
-    
+
     elif viz_type == "vertical_bars":
-        bars = params.get("bars", 48)
         return (
-            f"[1:a]ahistogram=r=30:s={width}x{height},format=rgba,"
-            f"colorchannelmixer=aa={opacity}[viz]"
+            f"[1:a]showfreqs=s={width}x{int(height*0.4)}:rate=30:mode=bar:"
+            f"ascale=log:fscale=log:colors={viz_color},{alpha(opacity)}"
         )
-    
+
+    elif viz_type == "horizontal_equalizer":
+        return (
+            f"[1:a]showfreqs=s={int(width*0.7)}x{int(height*0.18)}:rate=30:mode=bar:"
+            f"ascale=log:fscale=log:colors={viz_color},"
+            f"{alpha(opacity * 0.6)}"
+        )
+
     elif viz_type == "waveform":
         return (
             f"[1:a]showwaves=s={width}x{height}:mode=cline:rate=30:"
-            f"colors={viz_color}|{viz_color2},format=rgba,"
-            f"colorchannelmixer=aa={opacity}[viz]"
+            f"colors={viz_color}|{viz_color2},{alpha(opacity)}"
         )
-    
-    elif viz_type == "horizontal_equalizer":
-        return (
-            f"[1:a]showwaves=s={int(width*0.7)}x{int(height*0.2)}:mode=cline:rate=30:"
-            f"colors={viz_color}|{viz_color2},format=rgba,"
-            f"colorchannelmixer=aa={opacity * 0.4}[viz]"
-        )
-    
+
     elif viz_type == "minimal_spectrum":
-        bars = params.get("bars", 24)
         opacity = params.get("opacity", 0.3)
-        # Use showwaves with thin lines
         return (
-            f"[1:a]showwaves=s={int(width*0.6)}x{int(height*0.15)}:mode=cline:rate=30:"
-            f"colors={viz_color},format=rgba,"
-            f"colorchannelmixer=aa={opacity}[viz]"
+            f"[1:a]showwaves=s={int(width*0.6)}x{int(height*0.15)}:mode=line:rate=30:"
+            f"colors={viz_color},{alpha(opacity)}"
         )
-    
+
     else:
         return (
             f"[1:a]showwaves=s={width}x{height}:mode=cline:rate=30:"
-            f"colors={viz_color}|{viz_color2},format=rgba,"
-            f"colorchannelmixer=aa={opacity}[viz]"
+            f"colors={viz_color}|{viz_color2},{alpha(opacity)}"
         )
 
 

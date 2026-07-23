@@ -6,7 +6,7 @@ generates word-level and line-level synchronized ASS subtitles.
 
 import json
 import re
-import whisper
+import difflib
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Optional
@@ -33,20 +33,21 @@ class LyricsResult:
 
 
 def process_lyrics(audio_path: str, lyrics: Optional[str] = None,
-                   style_config: dict = None) -> LyricsResult:
+                   style_config: dict = None,
+                   model_name: str = "base") -> LyricsResult:
     """
     Process lyrics: if provided, sync to audio; if not, transcribe with Whisper.
     Returns ASS, SRT, and LRC formats.
     """
     audio_path = str(audio_path)
-    
+
     if lyrics and lyrics.strip():
         # User provided lyrics — try to sync with Whisper timestamps
-        lines = sync_provided_lyrics(audio_path, lyrics)
+        lines = sync_provided_lyrics(audio_path, lyrics, model_name=model_name)
         source = "user"
     else:
         # Transcribe with Whisper
-        lines = transcribe_with_whisper(audio_path)
+        lines = transcribe_with_whisper(audio_path, model_name=model_name)
         source = "whisper"
     
     # Generate subtitle formats
@@ -67,6 +68,7 @@ def process_lyrics(audio_path: str, lyrics: Optional[str] = None,
 
 def transcribe_with_whisper(audio_path: str, model_name: str = "base") -> List[LyricLine]:
     """Transcribe audio with Whisper and create karaoke lines."""
+    import whisper
     model = whisper.load_model(model_name)
     result = model.transcribe(audio_path, word_timestamps=True, verbose=False)
     
@@ -134,67 +136,180 @@ def transcribe_with_whisper(audio_path: str, model_name: str = "base") -> List[L
     return lines
 
 
-def sync_provided_lyrics(audio_path: str, lyrics: str) -> List[LyricLine]:
-    """Sync user-provided lyrics to audio using Whisper for timing."""
-    # Transcribe to get timing
-    model = whisper.load_model("base")
+def sync_provided_lyrics(audio_path: str, lyrics: str,
+                         model_name: str = "base") -> List[LyricLine]:
+    """Sync user-provided lyrics to audio via forced alignment.
+
+    Whisper transcribes the audio to get word-level timestamps, then the
+    user's lyrics are aligned to that recognized word stream: words Whisper
+    heard receive their real timestamps, and any words in between are
+    interpolated across the surrounding anchors. This keeps the correct
+    (user-supplied) spelling while getting timing from the audio — far more
+    accurate than distributing lines evenly over the duration.
+    """
+    import whisper
+    model = whisper.load_model(model_name)
     result = model.transcribe(audio_path, word_timestamps=True, verbose=False)
-    
-    # Parse provided lyrics into lines
+
     provided_lines = [l.strip() for l in lyrics.strip().split("\n") if l.strip()]
-    
-    # Get Whisper segments for timing reference
+    if not provided_lines:
+        return []
+
     segments = result.get("segments", [])
-    whisper_text = " ".join(seg["text"].strip() for seg in segments)
+
+    # Flatten Whisper's recognized words with their timestamps.
     whisper_words = []
     for seg in segments:
         for w in seg.get("words", []):
-            whisper_words.append(w)
-    
-    # If no word timestamps, fall back to segment timing
+            wt = str(w.get("word", "")).strip()
+            if wt:
+                whisper_words.append({
+                    "word": wt,
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                })
+    # If there are no word-level timestamps, fall back to segment-level timing.
     if not whisper_words:
-        whisper_words = [{"word": seg["text"].strip(), "start": seg["start"], "end": seg["end"]} 
-                        for seg in segments]
-    
-    # Match provided lines to Whisper segments by time proportion
-    total_duration = segments[-1]["end"] if segments else 30.0
-    
-    lines = []
-    num_lines = len(provided_lines)
-    
-    # Distribute time proportionally based on Whisper segment timing
-    for i, text in enumerate(provided_lines):
-        # Calculate proportional time window
-        start_frac = i / num_lines
-        end_frac = (i + 1) / num_lines
-        
-        start_time = total_duration * start_frac
-        end_time = total_duration * end_frac
-        
-        # Try to align with Whisper segments
         for seg in segments:
-            if seg["start"] <= start_time <= seg["end"]:
-                start_time = seg["start"]
-                break
-        
-        # Try to find word-level timing
+            for tok in str(seg.get("text", "")).split():
+                whisper_words.append({
+                    "word": tok,
+                    "start": float(seg["start"]),
+                    "end": float(seg["end"]),
+                })
+
+    total_duration = float(segments[-1]["end"]) if segments else 30.0
+
+    # Nothing to align against — fall back to even distribution.
+    if not whisper_words:
+        return _proportional_lines(provided_lines, total_duration)
+
+    # Build a flat list of the user's word tokens, remembering which line each
+    # belongs to so we can regroup after timing them.
+    tokens = []
+    for li, line_text in enumerate(provided_lines):
+        for word in line_text.split():
+            tokens.append({"word": word, "line": li, "start": None, "end": None})
+
+    prov_norm = [_normalize_token(t["word"]) for t in tokens]
+    whis_norm = [_normalize_token(w["word"]) for w in whisper_words]
+
+    # Anchor matching provided words to recognized words in sequence order.
+    matcher = difflib.SequenceMatcher(a=prov_norm, b=whis_norm, autojunk=False)
+    matched = 0
+    for block in matcher.get_matching_blocks():
+        for k in range(block.size):
+            a_idx = block.a + k
+            b_idx = block.b + k
+            if not prov_norm[a_idx]:  # skip empty (punctuation-only) tokens
+                continue
+            tokens[a_idx]["start"] = whisper_words[b_idx]["start"]
+            tokens[a_idx]["end"] = whisper_words[b_idx]["end"]
+            matched += 1
+
+    # Too few anchors to trust the alignment — fall back to even distribution.
+    if matched < max(1, int(len(tokens) * 0.15)):
+        return _proportional_lines(provided_lines, total_duration)
+
+    _interpolate_unmatched(tokens, total_duration)
+
+    # Regroup timed tokens back into their original lines.
+    lines = []
+    for li, line_text in enumerate(provided_lines):
+        line_tokens = [t for t in tokens if t["line"] == li]
+        if not line_tokens:
+            continue
         words = []
+        for t in line_tokens:
+            start = float(t["start"])
+            end = max(float(t["end"]), start + 0.05)
+            words.append({"word": t["word"], "start": round(start, 3), "end": round(end, 3)})
+        line_start = words[0]["start"]
+        line_end = max(words[-1]["end"], line_start + 0.3)
+        lines.append(LyricLine(text=line_text, start=line_start, end=line_end, words=words))
+
+    return lines
+
+
+def _normalize_token(token: str) -> str:
+    """Lowercase a word and drop punctuation for alignment comparisons."""
+    return "".join(ch for ch in token.strip().lower() if ch.isalnum())
+
+
+def _interpolate_unmatched(tokens: list, total_duration: float) -> None:
+    """Fill in start/end for tokens Whisper did not anchor, in place.
+
+    Unmatched runs are spread evenly between the timestamps of the nearest
+    anchored words on either side (or the clip boundaries at the edges).
+    """
+    n = len(tokens)
+    if n == 0:
+        return
+
+    anchors = [i for i, t in enumerate(tokens) if t["start"] is not None]
+
+    # No anchors survived — spread everything evenly over the duration.
+    if not anchors:
+        step = total_duration / n
+        for i, t in enumerate(tokens):
+            t["start"] = i * step
+            t["end"] = (i + 1) * step
+        return
+
+    # Leading run before the first anchor: spread over [0, first_start).
+    first = anchors[0]
+    if first > 0:
+        end_t = tokens[first]["start"]
+        step = end_t / first
+        for i in range(first):
+            tokens[i]["start"] = i * step
+            tokens[i]["end"] = (i + 1) * step
+
+    # Interior runs between consecutive anchors.
+    for a, b in zip(anchors, anchors[1:]):
+        gap = b - a - 1
+        if gap <= 0:
+            continue
+        t0 = tokens[a]["end"]
+        t1 = tokens[b]["start"]
+        step = max(0.0, t1 - t0) / gap
+        for j in range(1, gap + 1):
+            idx = a + j
+            tokens[idx]["start"] = t0 + (j - 1) * step
+            tokens[idx]["end"] = t0 + j * step
+
+    # Trailing run after the last anchor: spread over (last_end, total_duration].
+    last = anchors[-1]
+    trailing = n - 1 - last
+    if trailing > 0:
+        t0 = tokens[last]["end"]
+        t1 = max(total_duration, t0 + trailing * 0.3)
+        step = (t1 - t0) / trailing
+        for j in range(1, trailing + 1):
+            idx = last + j
+            tokens[idx]["start"] = t0 + (j - 1) * step
+            tokens[idx]["end"] = t0 + j * step
+
+
+def _proportional_lines(provided_lines: List[str], total_duration: float) -> List[LyricLine]:
+    """Fallback: distribute lines evenly across the duration when alignment
+    is not possible (no usable Whisper timing or too few matched words)."""
+    lines = []
+    num_lines = max(len(provided_lines), 1)
+    for i, text in enumerate(provided_lines):
+        start_time = total_duration * (i / num_lines)
+        end_time = total_duration * ((i + 1) / num_lines)
         words_in_line = text.split()
-        line_duration = end_time - start_time
-        word_duration = line_duration / max(len(words_in_line), 1)
-        
+        word_duration = (end_time - start_time) / max(len(words_in_line), 1)
+        words = []
         for j, word in enumerate(words_in_line):
-            w_start = start_time + j * word_duration
-            w_end = start_time + (j + 1) * word_duration
-            words.append({"word": word, "start": w_start, "end": w_end})
-        
-        lines.append(LyricLine(
-            text=text,
-            start=start_time,
-            end=end_time,
-            words=words,
-        ))
-    
+            words.append({
+                "word": word,
+                "start": round(start_time + j * word_duration, 3),
+                "end": round(start_time + (j + 1) * word_duration, 3),
+            })
+        lines.append(LyricLine(text=text, start=round(start_time, 3),
+                               end=round(end_time, 3), words=words))
     return lines
 
 
@@ -297,7 +412,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if transition_type == "fade" or transition_type == "dissolve":
             text = f"{{\\fad(300,200)}}{text}"
         elif transition_type == "slide_fade":
-            text = f"{{\\fad(200,150)\\move(x1,y1,x2,y2)}}{text}"
+            # Quick fade in/out (a true positional slide needs absolute
+            # coordinates, which vary with resolution — a snappy fade is the
+            # resolution-independent equivalent).
+            text = f"{{\\fad(200,150)}}{text}"
         elif transition_type == "zoom_in":
             text = f"{{\\fad(200,150)\\fscx0\\fscy0\\t(0,300,\\fscx100\\fscy100)}}{text}"
         elif transition_type == "soft_grow":

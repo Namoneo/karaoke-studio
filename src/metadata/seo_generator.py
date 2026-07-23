@@ -74,7 +74,7 @@ def generate_metadata(
         f"Perfect for singing alone, with friends, or recording your own cover.",
         "",
         f"⏱️ Duration: {int(duration // 60)}:{int(duration % 60):02d}",
-        f"🎼 Key: {genre}",
+        f"🎼 Genre: {genre}",
         f"💃 Tempo: {bpm:.0f} BPM",
         f"🎨 Mood: {mood.title()}",
         "",

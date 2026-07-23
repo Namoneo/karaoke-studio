@@ -5,6 +5,7 @@ Every song gets a unique visual identity.
 """
 
 import random
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List
 
@@ -38,15 +39,79 @@ class VisualStyle:
     description: str            # human-readable description
 
 
-# Available system fonts
-FONT_MAP = {
-    "modern_sans": "/System/Library/Fonts/HelveticaNeue.ttc",
-    "rounded": "/System/Library/Fonts/Avenir Next.ttc",
-    "elegant_serif": "/System/Library/Fonts/Supplemental/AmericanTypewriter.ttc",
-    "bold_sans": "/System/Library/Fonts/Helvetica.ttc",
-    "clean_sans": "/System/Library/Fonts/Avenir.ttc",
-    "mono": "/System/Library/Fonts/Courier.ttc",
+# Font roles → ordered candidate files per platform (macOS, then common Linux
+# locations, then Windows). resolve_font() returns the first that exists,
+# falling back to matplotlib's bundled DejaVuSans so the pipeline runs on any
+# platform even when none of the named fonts are installed.
+_FONT_CANDIDATES = {
+    "modern_sans": [
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ],
+    "rounded": [
+        "/System/Library/Fonts/Avenir Next.ttc",
+        "/usr/share/fonts/truetype/quicksand/Quicksand-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "C:\\Windows\\Fonts\\segoeui.ttf",
+    ],
+    "elegant_serif": [
+        "/System/Library/Fonts/Supplemental/AmericanTypewriter.ttc",
+        "/System/Library/Fonts/Supplemental/Georgia.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+        "C:\\Windows\\Fonts\\georgia.ttf",
+    ],
+    "bold_sans": [
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "C:\\Windows\\Fonts\\arialbd.ttf",
+    ],
+    "clean_sans": [
+        "/System/Library/Fonts/Avenir.ttc",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:\\Windows\\Fonts\\calibri.ttf",
+    ],
+    "mono": [
+        "/System/Library/Fonts/Courier.ttc",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "C:\\Windows\\Fonts\\consola.ttf",
+    ],
 }
+
+
+def _matplotlib_fallback_font() -> str:
+    """Path to DejaVuSans.ttf, which ships with matplotlib (a hard dependency),
+    so it is available wherever the pipeline can run. Returns "" if not found."""
+    try:
+        import matplotlib
+        p = Path(matplotlib.get_data_path()) / "fonts" / "ttf" / "DejaVuSans.ttf"
+        if p.exists():
+            return str(p)
+    except Exception:
+        pass
+    return ""
+
+
+def resolve_font(role: str) -> str:
+    """Resolve a logical font role to an existing font file on this platform.
+
+    Tries the platform-specific candidates in order, then matplotlib's bundled
+    DejaVuSans, and only as a last resort returns the first (macOS) candidate.
+    """
+    candidates = _FONT_CANDIDATES.get(role, _FONT_CANDIDATES["modern_sans"])
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+    fallback = _matplotlib_fallback_font()
+    return fallback or candidates[0]
 
 
 def generate_style(mood: str, palette: list, energy: float, valence: float, bpm: float, seed: int = None) -> VisualStyle:
@@ -262,8 +327,8 @@ def generate_style(mood: str, palette: list, energy: float, valence: float, bpm:
         bg_params=bg["params"],
         viz_type=viz["type"],
         viz_params=viz["params"],
-        font_primary=FONT_MAP[font_key],
-        font_secondary=FONT_MAP.get("modern_sans", FONT_MAP["clean_sans"]),
+        font_primary=resolve_font(font_key),
+        font_secondary=resolve_font("modern_sans"),
         font_size_lyrics=font_size_lyrics,
         font_size_title=font_size_title,
         font_color=font_color,
