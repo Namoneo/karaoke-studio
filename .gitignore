@@ -1,0 +1,5 @@
+output/
+venv/
+test_audio.wav
+__pycache__/
+*.pyc
