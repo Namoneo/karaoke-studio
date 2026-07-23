@@ -33,20 +33,21 @@ class LyricsResult:
 
 
 def process_lyrics(audio_path: str, lyrics: Optional[str] = None,
-                   style_config: dict = None) -> LyricsResult:
+                   style_config: dict = None,
+                   model_name: str = "base") -> LyricsResult:
     """
     Process lyrics: if provided, sync to audio; if not, transcribe with Whisper.
     Returns ASS, SRT, and LRC formats.
     """
     audio_path = str(audio_path)
-    
+
     if lyrics and lyrics.strip():
         # User provided lyrics — try to sync with Whisper timestamps
-        lines = sync_provided_lyrics(audio_path, lyrics)
+        lines = sync_provided_lyrics(audio_path, lyrics, model_name=model_name)
         source = "user"
     else:
         # Transcribe with Whisper
-        lines = transcribe_with_whisper(audio_path)
+        lines = transcribe_with_whisper(audio_path, model_name=model_name)
         source = "whisper"
     
     # Generate subtitle formats
@@ -134,10 +135,11 @@ def transcribe_with_whisper(audio_path: str, model_name: str = "base") -> List[L
     return lines
 
 
-def sync_provided_lyrics(audio_path: str, lyrics: str) -> List[LyricLine]:
+def sync_provided_lyrics(audio_path: str, lyrics: str,
+                         model_name: str = "base") -> List[LyricLine]:
     """Sync user-provided lyrics to audio using Whisper for timing."""
     # Transcribe to get timing
-    model = whisper.load_model("base")
+    model = whisper.load_model(model_name)
     result = model.transcribe(audio_path, word_timestamps=True, verbose=False)
     
     # Parse provided lyrics into lines
@@ -297,7 +299,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if transition_type == "fade" or transition_type == "dissolve":
             text = f"{{\\fad(300,200)}}{text}"
         elif transition_type == "slide_fade":
-            text = f"{{\\fad(200,150)\\move(x1,y1,x2,y2)}}{text}"
+            # Quick fade in/out (a true positional slide needs absolute
+            # coordinates, which vary with resolution — a snappy fade is the
+            # resolution-independent equivalent).
+            text = f"{{\\fad(200,150)}}{text}"
         elif transition_type == "zoom_in":
             text = f"{{\\fad(200,150)\\fscx0\\fscy0\\t(0,300,\\fscx100\\fscy100)}}{text}"
         elif transition_type == "soft_grow":

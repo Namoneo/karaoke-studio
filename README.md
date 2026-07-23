@@ -30,7 +30,7 @@ git clone https://github.com/Namoneo/karaoke-studio.git
 cd karaoke-studio
 python3.12 -m venv venv
 source venv/bin/activate
-pip install librosa matplotlib numpy scipy pillow pydub openai-whisper
+pip install -r requirements.txt
 ```
 
 ## Usage
